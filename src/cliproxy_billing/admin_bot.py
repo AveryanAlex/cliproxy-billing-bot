@@ -10,7 +10,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, Message
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -19,7 +19,27 @@ from .keeper import KeeperError
 from .ledger import LedgerError, get_balance, review_payment, submit_payment
 from .models import BillingRun, KeyCharge, KeyOwnership, Payment, User
 from .money import money_text, parse_minor, parse_positive_decimal
-from .ui import balance_text, buttons, history_text, send_text
+from .ui import (
+    ADMIN_ACTION_BUTTONS,
+    ADMIN_DRAFT_BUTTON,
+    ADMIN_MANUAL_BUTTON,
+    ADMIN_NEW_BUTTON,
+    ADMIN_PENDING_BUTTON,
+    ADMIN_UNLINKED_BUTTON,
+    ADMIN_USERS_BUTTON,
+    DRAFT_DISCARD_BUTTON,
+    DRAFT_PUBLISH_BUTTON,
+    RUB_BUTTON,
+    USD_BUTTON,
+    admin_keyboard,
+    balance_text,
+    buttons,
+    cancel_keyboard,
+    currency_keyboard,
+    draft_keyboard,
+    history_text,
+    send_text,
+)
 from .user_bot import send_admin_review
 
 logger = logging.getLogger(__name__)
@@ -38,13 +58,8 @@ class ManualPayment(StatesGroup):
     amount = State()
 
 
-def admin_menu() -> InlineKeyboardMarkup:
-    return buttons(
-        (("🧮 Новый расчёт", "admin:new"), ("📋 Черновик", "admin:draft")),
-        (("💳 Проверить оплаты", "admin:pending"), ("👥 Участники", "admin:users")),
-        (("🔑 Непривязанные начисления", "admin:unlinked"),),
-        (("➕ Занести платёж / аванс", "admin:manual"),),
-    )
+class DraftReview(StatesGroup):
+    review = State()
 
 
 async def _run_user_amount(session: AsyncSession, run_id: int, user_id: int) -> tuple[int, int]:
@@ -71,47 +86,57 @@ def make_admin_router(
     router.callback_query.filter(F.from_user.id.in_(admin_ids))
 
     @router.message(Command("admin"))
-    async def admin_home(message: Message, bot: Bot) -> None:
+    async def admin_home(message: Message, state: FSMContext, bot: Bot) -> None:
         if message.chat.type != "private" or message.from_user is None:
             return
+        await state.clear()
         await bot.send_message(
-            message.from_user.id, "Управление расчётами и платежами.", reply_markup=admin_menu()
+            message.from_user.id, "Управление расчётами и платежами.", reply_markup=admin_keyboard()
         )
 
-    @router.callback_query(F.data == "admin:new")
-    async def begin_billing(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-        await query.answer()
+    async def display_draft(bot: Bot, state: FSMContext, admin_id: int) -> bool:
         draft = await billing.existing_draft()
-        if draft is not None:
-            await state.clear()
-            await send_text(
-                bot,
-                query.from_user.id,
-                draft.text(),
-                markup=buttons(
-                    (("✅ Опубликовать", f"admin:publish:{draft.run_id}"),),
-                    (("🗑 Отменить черновик", f"admin:discard:{draft.run_id}"),),
-                ),
-            )
+        if draft is None:
+            return False
+        await state.clear()
+        await state.update_data(run_id=draft.run_id)
+        await state.set_state(DraftReview.review)
+        await send_text(bot, admin_id, draft.text(), markup=draft_keyboard())
+        return True
+
+    async def begin_billing_action(bot: Bot, state: FSMContext, admin_id: int) -> None:
+        if await display_draft(bot, state, admin_id):
             return
         await state.clear()
         if await billing.initial_date_needed():
             await state.set_state(NewBilling.initial_date)
             await bot.send_message(
-                query.from_user.id,
+                admin_id,
                 "Это первый расчёт. Введите дату начала периода YYYY-MM-DD. "
                 "Всё до этой даты считается урегулированным вне бота.",
+                reply_markup=cancel_keyboard(),
             )
         else:
             start = await billing.next_start_date()
             await state.set_state(NewBilling.subscription)
             await bot.send_message(
-                query.from_user.id,
+                admin_id,
                 f"Период: с {start} по {(billing.today() - timedelta(days=1))} включительно.\n"
                 "Введите стоимость подписки в USD, без комиссии.",
+                reply_markup=cancel_keyboard(),
             )
 
-    @router.message(NewBilling.initial_date, F.text)
+    @router.message(F.chat.type == "private", F.text == ADMIN_NEW_BUTTON)
+    async def begin_billing_message(message: Message, state: FSMContext, bot: Bot) -> None:
+        if message.from_user is not None:
+            await begin_billing_action(bot, state, message.from_user.id)
+
+    @router.callback_query(F.data == "admin:new")
+    async def begin_billing(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+        await query.answer()
+        await begin_billing_action(bot, state, query.from_user.id)
+
+    @router.message(NewBilling.initial_date, F.text, ~F.text.in_(ADMIN_ACTION_BUTTONS))
     async def billing_start_date(message: Message, state: FSMContext) -> None:
         try:
             start = date.fromisoformat((message.text or "").strip())
@@ -125,41 +150,47 @@ def make_admin_router(
         await state.set_state(NewBilling.subscription)
         await message.answer(
             f"Первый период: {start} — {billing.today() - timedelta(days=1)}.\n"
-            "Введите стоимость подписки в USD, без комиссии."
+            "Введите стоимость подписки в USD, без комиссии.",
+            reply_markup=cancel_keyboard(),
         )
 
-    @router.message(NewBilling.subscription, F.text)
+    @router.message(NewBilling.subscription, F.text, ~F.text.in_(ADMIN_ACTION_BUTTONS))
     async def billing_subscription(message: Message, state: FSMContext) -> None:
         try:
             amount = parse_minor(message.text or "", name="Стоимость подписки")
         except ValueError as error:
-            await message.answer(str(error))
+            await message.answer(f"{error} Введите сумму в USD, например 400.00.")
             return
         await state.update_data(subscription_usd_cents=amount)
         await state.set_state(NewBilling.fee)
-        await message.answer("Введите комиссию в процентах, например 1 или 1.5. Можно 0.")
+        await message.answer(
+            "Введите комиссию в процентах, например 1 или 1.5. Можно 0.",
+            reply_markup=cancel_keyboard(),
+        )
 
-    @router.message(NewBilling.fee, F.text)
+    @router.message(NewBilling.fee, F.text, ~F.text.in_(ADMIN_ACTION_BUTTONS))
     async def billing_fee(message: Message, state: FSMContext) -> None:
         try:
             fee = parse_positive_decimal(message.text or "", name="Комиссия", allow_zero=True)
             if fee > 100:
                 raise ValueError("Комиссия должна быть не больше 100%")
         except ValueError as error:
-            await message.answer(str(error))
+            await message.answer(f"{error} Введите процент, например 1 или 1.5.")
             return
         await state.update_data(fee_percent=str(fee))
         await state.set_state(NewBilling.exchange_rate)
-        await message.answer("Введите курс ₽ за $1, например 88.75.")
+        await message.answer(
+            "Введите курс ₽ за $1, например 88.75.", reply_markup=cancel_keyboard()
+        )
 
-    @router.message(NewBilling.exchange_rate, F.text)
+    @router.message(NewBilling.exchange_rate, F.text, ~F.text.in_(ADMIN_ACTION_BUTTONS))
     async def billing_exchange_rate(message: Message, state: FSMContext, bot: Bot) -> None:
         try:
             rate = parse_positive_decimal(message.text or "", name="Курс")
             if rate < 1:
                 raise ValueError("Курс должен быть не меньше 1 ₽ за доллар")
         except ValueError as error:
-            await message.answer(str(error))
+            await message.answer(f"{error} Введите курс, например 88.75.")
             return
         data = await state.get_data()
         await state.clear()
@@ -178,57 +209,80 @@ def make_admin_router(
         except (BillingError, KeeperError, ValueError) as error:
             await message.answer(
                 f"Расчёт не выпущен: {error}\n"
-                "Исправьте причину и начните заново через «Управление»."
+                "Исправьте причину и начните заново через «Новый расчёт».",
+                reply_markup=admin_keyboard(),
             )
             return
-        await send_text(
-            bot,
-            message.chat.id,
-            draft.text(),
-            markup=buttons(
-                (("✅ Опубликовать", f"admin:publish:{draft.run_id}"),),
-                (("🗑 Отменить черновик", f"admin:discard:{draft.run_id}"),),
-            ),
-        )
+        await state.update_data(run_id=draft.run_id)
+        await state.set_state(DraftReview.review)
+        await send_text(bot, message.chat.id, draft.text(), markup=draft_keyboard())
+
+    async def show_draft_action(bot: Bot, state: FSMContext, admin_id: int) -> None:
+        if not await display_draft(bot, state, admin_id):
+            await state.clear()
+            await bot.send_message(admin_id, "Черновика нет.", reply_markup=admin_keyboard())
+
+    @router.message(F.chat.type == "private", F.text == ADMIN_DRAFT_BUTTON)
+    async def show_draft_message(message: Message, state: FSMContext, bot: Bot) -> None:
+        if message.from_user is not None:
+            await show_draft_action(bot, state, message.from_user.id)
 
     @router.callback_query(F.data == "admin:draft")
-    async def show_draft(query: CallbackQuery, bot: Bot) -> None:
+    async def show_draft(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await query.answer()
-        draft = await billing.existing_draft()
-        if draft is None:
-            await bot.send_message(query.from_user.id, "Черновика нет.", reply_markup=admin_menu())
+        await show_draft_action(bot, state, query.from_user.id)
+
+    async def discard_action(bot: Bot, state: FSMContext, admin_id: int, run_id: int) -> None:
+        try:
+            await billing.discard(run_id)
+        except (BillingError, ValueError) as error:
+            await bot.send_message(admin_id, str(error))
+            if not await display_draft(bot, state, admin_id):
+                await state.clear()
+                await bot.send_message(admin_id, "Черновика нет.", reply_markup=admin_keyboard())
             return
-        await send_text(
-            bot,
-            query.from_user.id,
-            draft.text(),
-            markup=buttons(
-                (("✅ Опубликовать", f"admin:publish:{draft.run_id}"),),
-                (("🗑 Отменить черновик", f"admin:discard:{draft.run_id}"),),
-            ),
-        )
+        await state.clear()
+        await bot.send_message(admin_id, "Черновик удалён.", reply_markup=admin_keyboard())
+
+    @router.message(DraftReview.review, F.text == DRAFT_DISCARD_BUTTON)
+    async def discard_message(message: Message, state: FSMContext, bot: Bot) -> None:
+        data = await state.get_data()
+        run_id = data.get("run_id")
+        if not isinstance(run_id, int) or message.from_user is None:
+            await state.clear()
+            await message.answer(
+                "Черновик не найден. Откройте его снова.", reply_markup=admin_keyboard()
+            )
+            return
+        await discard_action(bot, state, message.from_user.id, run_id)
 
     @router.callback_query(F.data.startswith("admin:discard:"))
-    async def discard(query: CallbackQuery, bot: Bot) -> None:
+    async def discard(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await query.answer()
         try:
-            await billing.discard(int((query.data or "").rsplit(":", 1)[-1]))
-        except (BillingError, ValueError) as error:
-            await bot.send_message(query.from_user.id, str(error))
+            run_id = int((query.data or "").rsplit(":", 1)[-1])
+        except ValueError:
             return
-        await bot.send_message(query.from_user.id, "Черновик удалён.", reply_markup=admin_menu())
+        await discard_action(bot, state, query.from_user.id, run_id)
 
-    @router.callback_query(F.data.startswith("admin:publish:"))
-    async def publish(query: CallbackQuery, bot: Bot) -> None:
-        await query.answer()
+    async def publish_action(bot: Bot, state: FSMContext, admin_id: int, run_id: int) -> None:
         try:
-            published = await billing.publish(int((query.data or "").rsplit(":", 1)[-1]))
+            published = await billing.publish(run_id)
         except (BillingError, ValueError) as error:
-            await bot.send_message(query.from_user.id, str(error))
+            await bot.send_message(admin_id, str(error))
+            if not await display_draft(bot, state, admin_id):
+                await state.clear()
+                await bot.send_message(admin_id, "Черновика нет.", reply_markup=admin_keyboard())
             return
+        await state.clear()
         async with sessions() as session:
             run = await session.get(BillingRun, published.run_id)
         if run is None:
+            await bot.send_message(
+                admin_id,
+                "Расчёт опубликован, но сведения о нём не найдены.",
+                reply_markup=admin_keyboard(),
+            )
             return
         end_day = run.end_exclusive - timedelta(days=1)
         failed_notifications: list[int] = []
@@ -242,9 +296,6 @@ def make_admin_router(
                     f"Новое начисление за {run.start_date} — {end_day}: "
                     f"{money_text(amount_usd, 'USD')} / {money_text(amount_rub, 'RUB')}.\n"
                     f"{balance_text(balance)}",
-                    reply_markup=buttons(
-                        (("📷 Оплатить", "pay:start"), ("📜 История", "user:history"))
-                    ),
                 )
             except TelegramAPIError:
                 failed_notifications.append(user_id)
@@ -258,22 +309,54 @@ def make_admin_router(
             note += (
                 f"\nНе удалось уведомить Telegram ID: {', '.join(map(str, failed_notifications))}."
             )
-        await bot.send_message(query.from_user.id, note, reply_markup=admin_menu())
+        await bot.send_message(admin_id, note, reply_markup=admin_keyboard())
 
-    @router.callback_query(F.data == "admin:pending")
-    async def pending(query: CallbackQuery, bot: Bot) -> None:
+    @router.message(DraftReview.review, F.text == DRAFT_PUBLISH_BUTTON)
+    async def publish_message(message: Message, state: FSMContext, bot: Bot) -> None:
+        data = await state.get_data()
+        run_id = data.get("run_id")
+        if not isinstance(run_id, int) or message.from_user is None:
+            await state.clear()
+            await message.answer(
+                "Черновик не найден. Откройте его снова.", reply_markup=admin_keyboard()
+            )
+            return
+        await publish_action(bot, state, message.from_user.id, run_id)
+
+    @router.callback_query(F.data.startswith("admin:publish:"))
+    async def publish(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await query.answer()
+        try:
+            run_id = int((query.data or "").rsplit(":", 1)[-1])
+        except ValueError:
+            return
+        await publish_action(bot, state, query.from_user.id, run_id)
+
+    async def pending_action(bot: Bot, state: FSMContext, admin_id: int) -> None:
+        await state.clear()
         async with sessions() as session:
             result = await session.scalars(
                 select(Payment.id).where(Payment.status == "pending").order_by(Payment.id)
             )
             ids = list(result.all())
         if not ids:
-            await bot.send_message(query.from_user.id, "Платежей на проверке нет.")
+            await bot.send_message(
+                admin_id, "Платежей на проверке нет.", reply_markup=admin_keyboard()
+            )
             return
-        await bot.send_message(query.from_user.id, f"На проверке: {len(ids)}.")
+        await bot.send_message(admin_id, f"На проверке: {len(ids)}.", reply_markup=admin_keyboard())
         for payment_id in ids:
-            await send_admin_review(bot, sessions, payment_id, frozenset({query.from_user.id}))
+            await send_admin_review(bot, sessions, payment_id, frozenset({admin_id}))
+
+    @router.message(F.chat.type == "private", F.text == ADMIN_PENDING_BUTTON)
+    async def pending_message(message: Message, state: FSMContext, bot: Bot) -> None:
+        if message.from_user is not None:
+            await pending_action(bot, state, message.from_user.id)
+
+    @router.callback_query(F.data == "admin:pending")
+    async def pending(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+        await query.answer()
+        await pending_action(bot, state, query.from_user.id)
 
     @router.callback_query(F.data.startswith("review:"))
     async def review(query: CallbackQuery, bot: Bot) -> None:
@@ -303,14 +386,12 @@ def make_admin_router(
                     if parts[1] == "yes"
                     else "Проверьте перевод и отправьте скриншот ещё раз."
                 ),
-                reply_markup=buttons((("📷 Оплатить", "pay:start"), ("💰 Баланс", "user:balance"))),
             )
         except TelegramAPIError:
             logger.warning("Could not notify user %s about payment %s", user_id, payment.id)
 
-    @router.callback_query(F.data == "admin:users")
-    async def users(query: CallbackQuery, bot: Bot) -> None:
-        await query.answer()
+    async def users_action(bot: Bot, state: FSMContext, admin_id: int) -> None:
+        await state.clear()
         async with sessions() as session:
             rows = list((await session.scalars(select(User).order_by(User.telegram_id))).all())
             lines = ["Участники:"]
@@ -325,16 +406,25 @@ def make_admin_router(
                 )
             if not rows:
                 lines.append("Пока никто не зарегистрировался.")
-        menu_rows = [
+        person_rows = [
             ((user.display_name[:30], f"admin:person:{user.telegram_id}"),) for user in rows
         ]
-        menu_rows.append((("⬅️ Управление", "admin:home"),))
         await send_text(
             bot,
-            query.from_user.id,
+            admin_id,
             "\n".join(lines),
-            markup=buttons(*menu_rows),
+            markup=buttons(*person_rows) if person_rows else admin_keyboard(),
         )
+
+    @router.message(F.chat.type == "private", F.text == ADMIN_USERS_BUTTON)
+    async def users_message(message: Message, state: FSMContext, bot: Bot) -> None:
+        if message.from_user is not None:
+            await users_action(bot, state, message.from_user.id)
+
+    @router.callback_query(F.data == "admin:users")
+    async def users(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+        await query.answer()
+        await users_action(bot, state, query.from_user.id)
 
     async def show_person(bot: Bot, admin_id: int, user_id: int) -> None:
         async with sessions() as session:
@@ -348,38 +438,40 @@ def make_admin_router(
             admin_id,
             f"{user.display_name} · Telegram ID {user_id}\n"
             f"{balance_text(balance)}\n\n{history_text(balance, time_zone)}",
-            markup=admin_menu(),
+            markup=admin_keyboard(),
         )
 
     @router.callback_query(F.data == "admin:home")
-    async def admin_home_callback(query: CallbackQuery, bot: Bot) -> None:
+    async def admin_home_callback(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await query.answer()
+        await state.clear()
         await bot.send_message(
-            query.from_user.id, "Управление расчётами и платежами.", reply_markup=admin_menu()
+            query.from_user.id, "Управление расчётами и платежами.", reply_markup=admin_keyboard()
         )
 
     @router.callback_query(F.data.startswith("admin:person:"))
-    async def person_history_callback(query: CallbackQuery, bot: Bot) -> None:
+    async def person_history_callback(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await query.answer()
         try:
             user_id = int((query.data or "").rsplit(":", 1)[-1])
         except ValueError:
             return
+        await state.clear()
         await show_person(bot, query.from_user.id, user_id)
 
     @router.message(Command("person"))
-    async def person_history(message: Message, bot: Bot) -> None:
+    async def person_history(message: Message, state: FSMContext, bot: Bot) -> None:
         if message.chat.type != "private" or message.from_user is None:
             return
         parts = (message.text or "").split(maxsplit=1)
         if len(parts) != 2 or not parts[1].isdigit():
             await message.answer("Использование: /person TELEGRAM_ID")
             return
+        await state.clear()
         await show_person(bot, message.from_user.id, int(parts[1]))
 
-    @router.callback_query(F.data == "admin:unlinked")
-    async def unlinked_charges(query: CallbackQuery, bot: Bot) -> None:
-        await query.answer()
+    async def unlinked_action(bot: Bot, state: FSMContext, admin_id: int) -> None:
+        await state.clear()
         async with sessions() as session:
             result = await session.execute(
                 select(KeyCharge, BillingRun)
@@ -403,18 +495,37 @@ def make_admin_router(
             )
         if not rows:
             lines.append("Нет.")
-        await send_text(bot, query.from_user.id, "\n".join(lines), markup=admin_menu())
+        await send_text(bot, admin_id, "\n".join(lines), markup=admin_keyboard())
+
+    @router.message(F.chat.type == "private", F.text == ADMIN_UNLINKED_BUTTON)
+    async def unlinked_message(message: Message, state: FSMContext, bot: Bot) -> None:
+        if message.from_user is not None:
+            await unlinked_action(bot, state, message.from_user.id)
+
+    @router.callback_query(F.data == "admin:unlinked")
+    async def unlinked_charges(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+        await query.answer()
+        await unlinked_action(bot, state, query.from_user.id)
+
+    async def begin_manual_action(bot: Bot, state: FSMContext, admin_id: int) -> None:
+        await state.clear()
+        await state.set_state(ManualPayment.user_id)
+        await bot.send_message(
+            admin_id,
+            "Введите Telegram ID участника из раздела «Участники». "
+            "Так можно занести уже полученный платёж или аванс.",
+            reply_markup=cancel_keyboard(),
+        )
+
+    @router.message(F.chat.type == "private", F.text == ADMIN_MANUAL_BUTTON)
+    async def begin_manual_message(message: Message, state: FSMContext, bot: Bot) -> None:
+        if message.from_user is not None:
+            await begin_manual_action(bot, state, message.from_user.id)
 
     @router.callback_query(F.data == "admin:manual")
     async def begin_manual(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await query.answer()
-        await state.clear()
-        await state.set_state(ManualPayment.user_id)
-        await bot.send_message(
-            query.from_user.id,
-            "Введите Telegram ID участника из раздела «Участники». "
-            "Так можно занести уже полученный платёж или аванс.",
-        )
+        await begin_manual_action(bot, state, query.from_user.id)
 
     @router.message(ManualPayment.user_id, F.text)
     async def manual_user(message: Message, state: FSMContext) -> None:
@@ -432,9 +543,36 @@ def make_admin_router(
         await state.set_state(ManualPayment.currency)
         await message.answer(
             f"Участник: {user.display_name}. Выберите валюту платежа.",
-            reply_markup=buttons(
-                (("💵 USD", "manual:currency:USD"), ("₽ RUB", "manual:currency:RUB")),
-            ),
+            reply_markup=currency_keyboard(),
+        )
+
+    @router.message(ManualPayment.user_id)
+    async def require_manual_user(message: Message) -> None:
+        await message.answer(
+            "Введите числовой Telegram ID участника или нажмите «Отмена».",
+            reply_markup=cancel_keyboard(),
+        )
+
+    async def choose_manual_currency(
+        bot: Bot, state: FSMContext, admin_id: int, currency: str
+    ) -> None:
+        await state.update_data(currency=currency)
+        await state.set_state(ManualPayment.amount)
+        await bot.send_message(
+            admin_id, f"Введите полученную сумму в {currency}.", reply_markup=cancel_keyboard()
+        )
+
+    @router.message(ManualPayment.currency, F.text.in_({USD_BUTTON, RUB_BUTTON}))
+    async def manual_currency_message(message: Message, state: FSMContext, bot: Bot) -> None:
+        if message.from_user is not None:
+            currency = "USD" if message.text == USD_BUTTON else "RUB"
+            await choose_manual_currency(bot, state, message.from_user.id, currency)
+
+    @router.message(ManualPayment.currency)
+    async def require_manual_currency(message: Message) -> None:
+        await message.answer(
+            "Выберите USD или RUB на клавиатуре либо нажмите «Отмена».",
+            reply_markup=currency_keyboard(),
         )
 
     @router.callback_query(F.data.startswith("manual:currency:"), ManualPayment.currency)
@@ -443,16 +581,14 @@ def make_admin_router(
         currency = (query.data or "").rsplit(":", 1)[-1]
         if currency not in {"USD", "RUB"}:
             return
-        await state.update_data(currency=currency)
-        await state.set_state(ManualPayment.amount)
-        await bot.send_message(query.from_user.id, f"Введите полученную сумму в {currency}.")
+        await choose_manual_currency(bot, state, query.from_user.id, currency)
 
     @router.message(ManualPayment.amount, F.text)
     async def manual_amount(message: Message, state: FSMContext, bot: Bot) -> None:
         try:
             amount = parse_minor(message.text or "", name="Сумма")
         except ValueError as error:
-            await message.answer(str(error))
+            await message.answer(f"{error} Введите сумму, например 12.34.")
             return
         data = await state.get_data()
         user_id = int(data["user_id"])
@@ -474,7 +610,7 @@ def make_admin_router(
         await bot.send_message(
             message.chat.id,
             f"Платёж #{payment.id} записан.\n{balance_text(balance)}",
-            reply_markup=admin_menu(),
+            reply_markup=admin_keyboard(),
         )
         try:
             await bot.send_message(
@@ -484,5 +620,29 @@ def make_admin_router(
             )
         except TelegramAPIError:
             logger.warning("Could not notify user %s about manual payment %s", user_id, payment.id)
+
+    @router.message(ManualPayment.amount)
+    async def require_manual_amount(message: Message) -> None:
+        await message.answer(
+            "Введите сумму числом, например 12.34, или нажмите «Отмена».",
+            reply_markup=cancel_keyboard(),
+        )
+
+    @router.message(DraftReview.review)
+    async def require_draft_action(message: Message) -> None:
+        await message.answer(
+            "Выберите публикацию, удаление черновика или «Отмена».",
+            reply_markup=draft_keyboard(),
+        )
+
+    @router.message(NewBilling.initial_date)
+    @router.message(NewBilling.subscription)
+    @router.message(NewBilling.fee)
+    @router.message(NewBilling.exchange_rate)
+    async def require_billing_number(message: Message) -> None:
+        await message.answer(
+            "Введите запрошенное значение текстом или нажмите «Отмена».",
+            reply_markup=cancel_keyboard(),
+        )
 
     return router

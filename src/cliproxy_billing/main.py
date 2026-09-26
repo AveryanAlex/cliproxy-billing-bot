@@ -17,7 +17,7 @@ from .billing import BillingService
 from .config import Settings
 from .db import initialize_database, make_engine, make_sessions
 from .keeper import KeeperClient
-from .navigation import make_navigation_router
+from .navigation import make_fallback_router, make_navigation_router
 from .user_bot import make_user_router
 
 
@@ -44,11 +44,12 @@ async def main() -> None:
         make_navigation_router(sessions, settings.admin_telegram_ids, settings.time_zone)
     )
     dispatcher.include_router(
-        make_user_router(sessions, keeper, settings.admin_telegram_ids, settings.time_zone)
-    )
-    dispatcher.include_router(
         make_admin_router(sessions, billing, settings.admin_telegram_ids, settings.time_zone)
     )
+    dispatcher.include_router(
+        make_user_router(sessions, keeper, settings.admin_telegram_ids, settings.time_zone)
+    )
+    dispatcher.include_router(make_fallback_router(settings.admin_telegram_ids))
     try:
         await clear_commands(bot, settings.admin_telegram_ids)
         await bot.delete_webhook(drop_pending_updates=False)

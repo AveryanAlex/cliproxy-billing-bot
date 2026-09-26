@@ -5,18 +5,28 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .keeper import KeeperClient, KeeperError
-from .ledger import LedgerError, get_balance, link_key, submit_payment, upsert_user, user_keys
+from .ledger import LedgerError, get_balance, link_key, submit_payment, upsert_user
 from .models import Payment, User
 from .money import money_text, parse_minor
 from .screens import show_balance, show_history, show_keys, show_payment_start
-from .ui import balance_text, buttons, main_keyboard, user_menu
+from .ui import (
+    PAY_CUSTOM_BUTTON,
+    PAY_FULL_BUTTON,
+    RUB_BUTTON,
+    USD_BUTTON,
+    balance_text,
+    buttons,
+    cancel_keyboard,
+    currency_keyboard,
+    main_keyboard,
+    payment_choice_keyboard,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +36,8 @@ class Linking(StatesGroup):
 
 
 class Paying(StatesGroup):
+    currency = State()
+    choice = State()
     amount = State()
     screenshot = State()
 
@@ -72,47 +84,16 @@ def make_user_router(
 ) -> Router:
     router = Router(name="users")
 
-    @router.message(CommandStart())
-    async def start(message: Message, state: FSMContext, bot: Bot) -> None:
-        if message.chat.type != "private" or message.from_user is None:
-            return
-        await state.clear()
-        user_id = message.from_user.id
-        async with sessions() as session:
-            async with session.begin():
-                await upsert_user(session, user_id, message.from_user.full_name)
-            keys = await user_keys(session, user_id)
-        await bot.send_message(
-            user_id,
-            "Выберите действие на клавиатуре ниже. Кнопки также отменяют текущий ввод.",
-            reply_markup=main_keyboard(is_admin=user_id in admin_ids),
-        )
-        if not keys:
-            await state.set_state(Linking.key)
-            await bot.send_message(
-                user_id,
-                "Привет! Отправьте ваш API-ключ одним сообщением. "
-                "После привязки можно добавить ещё один.",
-            )
-        else:
-            await show_balance(bot, sessions, user_id)
-
-    @router.message(Command("cancel"))
-    async def cancel(message: Message, state: FSMContext, bot: Bot) -> None:
-        if message.chat.type != "private" or message.from_user is None:
-            return
-        await state.clear()
-        await bot.send_message(
-            message.from_user.id,
-            "Действие отменено.",
-            reply_markup=main_keyboard(is_admin=message.from_user.id in admin_ids),
-        )
-
     @router.callback_query(F.data == "user:add_key")
     async def add_key(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await query.answer()
+        await state.clear()
         await state.set_state(Linking.key)
-        await bot.send_message(query.from_user.id, "Отправьте ещё один API-ключ одним сообщением.")
+        await bot.send_message(
+            query.from_user.id,
+            "Отправьте ещё один API-ключ одним сообщением.",
+            reply_markup=cancel_keyboard(),
+        )
 
     @router.message(Linking.key, F.text)
     async def receive_key(message: Message, state: FSMContext, bot: Bot) -> None:
@@ -152,53 +133,154 @@ def make_user_router(
         await bot.send_message(
             message.chat.id,
             f"{action}\n{balance_text(balance)}",
-            reply_markup=buttons(
-                (("➕ Добавить ещё ключ", "user:add_key"), ("✅ Готово", "user:balance")),
-            ),
+            reply_markup=main_keyboard(is_admin=message.from_user.id in admin_ids),
         )
 
     @router.message(Linking.key)
     async def require_key_text(message: Message) -> None:
         if message.chat.type == "private":
-            await message.answer("Отправьте API-ключ текстом одним сообщением.")
+            await message.answer(
+                "Отправьте API-ключ текстом одним сообщением или нажмите «Отмена».",
+                reply_markup=cancel_keyboard(),
+            )
 
     @router.callback_query(F.data == "user:balance")
-    async def balance_callback(query: CallbackQuery, bot: Bot) -> None:
+    async def balance_callback(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await query.answer()
-        await show_balance(bot, sessions, query.from_user.id)
+        await state.clear()
+        await show_balance(
+            bot, sessions, query.from_user.id, is_admin=query.from_user.id in admin_ids
+        )
 
     @router.callback_query(F.data == "user:history")
-    async def history_callback(query: CallbackQuery, bot: Bot) -> None:
+    async def history_callback(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await query.answer()
-        await show_history(bot, sessions, query.from_user.id, time_zone)
+        await state.clear()
+        await show_history(
+            bot, sessions, query.from_user.id, time_zone, is_admin=query.from_user.id in admin_ids
+        )
 
     @router.callback_query(F.data == "user:keys")
-    async def keys_callback(query: CallbackQuery, bot: Bot) -> None:
+    async def keys_callback(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await query.answer()
-        await show_keys(bot, sessions, query.from_user.id)
+        await state.clear()
+        await show_keys(bot, sessions, query.from_user.id, is_admin=query.from_user.id in admin_ids)
 
     @router.callback_query(F.data == "pay:start")
-    async def pay_start(query: CallbackQuery, bot: Bot) -> None:
+    async def pay_start(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await query.answer()
+        await state.clear()
+        await state.set_state(Paying.currency)
         await show_payment_start(bot, sessions, query.from_user.id)
 
+    async def choose_currency(bot: Bot, state: FSMContext, user_id: int, currency: str) -> None:
+        await state.update_data(currency=currency)
+        await state.set_state(Paying.choice)
+        async with sessions() as session:
+            balance = await get_balance(session, user_id)
+        due = balance.due_usd_cents if currency == "USD" else balance.due_rub_kopeks
+        await bot.send_message(
+            user_id,
+            f"Валюта: {currency}. Текущий долг: {money_text(due, currency)}. "
+            "Выберите сумму перевода.",
+            reply_markup=payment_choice_keyboard(has_debt=due > 0),
+        )
+
+    @router.message(Paying.currency, F.text.in_({USD_BUTTON, RUB_BUTTON}))
+    async def pay_currency_message(message: Message, state: FSMContext, bot: Bot) -> None:
+        if message.from_user is None:
+            return
+        currency = "USD" if message.text == USD_BUTTON else "RUB"
+        await choose_currency(bot, state, message.from_user.id, currency)
+
+    @router.message(Paying.currency)
+    async def require_currency(message: Message) -> None:
+        await message.answer(
+            "Выберите USD или RUB на клавиатуре либо нажмите «Отмена».",
+            reply_markup=currency_keyboard(),
+        )
+
     @router.callback_query(F.data.startswith("pay:choose:"))
-    async def pay_choose(query: CallbackQuery, bot: Bot) -> None:
+    async def pay_choose(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await query.answer()
         currency = (query.data or "").rsplit(":", 1)[-1]
         if currency not in {"USD", "RUB"}:
             return
+        await choose_currency(bot, state, query.from_user.id, currency)
+
+    async def choose_full_payment(bot: Bot, state: FSMContext, user_id: int) -> None:
+        data = await state.get_data()
+        currency = str(data.get("currency") or "")
+        if currency not in {"USD", "RUB"}:
+            await state.clear()
+            await bot.send_message(
+                user_id,
+                "Выбор валюты потерян. Начните оплату заново.",
+                reply_markup=main_keyboard(is_admin=user_id in admin_ids),
+            )
+            return
         async with sessions() as session:
-            balance = await get_balance(session, query.from_user.id)
-        due = balance.due_usd_cents if currency == "USD" else balance.due_rub_kopeks
-        rows: list[tuple[tuple[str, str], ...]] = []
-        if due > 0:
-            rows.append(((f"Погасить всё: {money_text(due, currency)}", f"pay:full:{currency}"),))
-        rows.append((("Другая сумма / аванс", f"pay:custom:{currency}"),))
+            balance = await get_balance(session, user_id)
+        amount = balance.due_usd_cents if currency == "USD" else balance.due_rub_kopeks
+        if amount <= 0:
+            await bot.send_message(
+                user_id,
+                "Долга нет. Для аванса выберите другую сумму.",
+                reply_markup=payment_choice_keyboard(has_debt=False),
+            )
+            return
+        await state.update_data(amount_minor=amount)
+        await state.set_state(Paying.screenshot)
         await bot.send_message(
-            query.from_user.id,
-            f"Валюта: {currency}. Укажите сумму перевода или погасите текущий долг.",
-            reply_markup=buttons(*rows),
+            user_id,
+            f"После перевода {money_text(amount, currency)} отправьте скриншот оплаты "
+            "как фото или изображение-файл.",
+            reply_markup=cancel_keyboard(),
+        )
+
+    @router.message(Paying.choice, F.text == PAY_FULL_BUTTON)
+    async def pay_full_message(message: Message, state: FSMContext, bot: Bot) -> None:
+        if message.from_user is not None:
+            await choose_full_payment(bot, state, message.from_user.id)
+
+    @router.message(Paying.choice, F.text == PAY_CUSTOM_BUTTON)
+    async def pay_custom_message(message: Message, state: FSMContext, bot: Bot) -> None:
+        data = await state.get_data()
+        currency = str(data.get("currency") or "")
+        if currency not in {"USD", "RUB"}:
+            await state.clear()
+            await message.answer(
+                "Выбор валюты потерян. Начните оплату заново.",
+                reply_markup=main_keyboard(
+                    is_admin=message.from_user is not None and message.from_user.id in admin_ids
+                ),
+            )
+            return
+        await state.set_state(Paying.amount)
+        await message.answer(
+            f"Введите фактически отправленную сумму в {currency}, например 12.34.",
+            reply_markup=cancel_keyboard(),
+        )
+
+    @router.message(Paying.choice)
+    async def require_payment_choice(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        currency = str(data.get("currency") or "")
+        if currency not in {"USD", "RUB"}:
+            await state.clear()
+            await message.answer(
+                "Шаг оплаты потерян. Начните заново.",
+                reply_markup=main_keyboard(
+                    is_admin=message.from_user is not None and message.from_user.id in admin_ids
+                ),
+            )
+            return
+        async with sessions() as session:
+            balance = await get_balance(session, message.from_user.id if message.from_user else 0)
+        due = balance.due_usd_cents if currency == "USD" else balance.due_rub_kopeks
+        await message.answer(
+            "Выберите «Погасить всё», «Другая сумма / аванс» или «Отмена».",
+            reply_markup=payment_choice_keyboard(has_debt=due > 0),
         )
 
     @router.callback_query(F.data.startswith("pay:full:"))
@@ -207,21 +289,8 @@ def make_user_router(
         currency = (query.data or "").rsplit(":", 1)[-1]
         if currency not in {"USD", "RUB"}:
             return
-        async with sessions() as session:
-            balance = await get_balance(session, query.from_user.id)
-        amount = balance.due_usd_cents if currency == "USD" else balance.due_rub_kopeks
-        if amount <= 0:
-            await bot.send_message(
-                query.from_user.id, "Долга нет. Для аванса выберите другую сумму."
-            )
-            return
-        await state.update_data(currency=currency, amount_minor=amount)
-        await state.set_state(Paying.screenshot)
-        await bot.send_message(
-            query.from_user.id,
-            f"После перевода {money_text(amount, currency)} отправьте скриншот оплаты "
-            "как фото или изображение-файл.",
-        )
+        await state.update_data(currency=currency)
+        await choose_full_payment(bot, state, query.from_user.id)
 
     @router.callback_query(F.data.startswith("pay:custom:"))
     async def pay_custom(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
@@ -234,6 +303,7 @@ def make_user_router(
         await bot.send_message(
             query.from_user.id,
             f"Введите фактически отправленную сумму в {currency}, например 12.34.",
+            reply_markup=cancel_keyboard(),
         )
 
     @router.message(Paying.amount, F.text)
@@ -243,7 +313,7 @@ def make_user_router(
         try:
             amount = parse_minor(message.text, name="Сумма")
         except ValueError as error:
-            await message.answer(str(error))
+            await message.answer(f"{error} Введите сумму числом, например 12.34.")
             return
         await state.update_data(amount_minor=amount)
         await state.set_state(Paying.screenshot)
@@ -251,12 +321,16 @@ def make_user_router(
         currency = str(data.get("currency"))
         await message.answer(
             f"После перевода {money_text(amount, currency)} отправьте скриншот оплаты "
-            "как фото или изображение-файл."
+            "как фото или изображение-файл.",
+            reply_markup=cancel_keyboard(),
         )
 
     @router.message(Paying.amount)
     async def require_amount(message: Message) -> None:
-        await message.answer("Введите сумму числом, например 12.34.")
+        await message.answer(
+            "Введите сумму числом, например 12.34, или нажмите «Отмена».",
+            reply_markup=cancel_keyboard(),
+        )
 
     @router.message(Paying.screenshot, F.photo | F.document)
     async def pay_screenshot(message: Message, state: FSMContext, bot: Bot) -> None:
@@ -278,7 +352,10 @@ def make_user_router(
         amount = data.get("amount_minor")
         if currency not in {"USD", "RUB"} or not isinstance(amount, int) or amount <= 0:
             await state.clear()
-            await message.answer("Сумма потеряна. Начните оплату заново.", reply_markup=user_menu())
+            await message.answer(
+                "Сумма потеряна. Начните оплату заново.",
+                reply_markup=main_keyboard(is_admin=message.from_user.id in admin_ids),
+            )
             return
         async with sessions() as session:
             async with session.begin():
@@ -295,12 +372,15 @@ def make_user_router(
         await message.answer(
             f"Подтверждение #{payment_id} отправлено на проверку. "
             "Баланс изменится после подтверждения администратором.",
-            reply_markup=user_menu(),
+            reply_markup=main_keyboard(is_admin=message.from_user.id in admin_ids),
         )
         await send_admin_review(bot, sessions, payment_id, admin_ids)
 
     @router.message(Paying.screenshot)
     async def require_screenshot(message: Message) -> None:
-        await message.answer("Отправьте скриншот как фото или файл изображения.")
+        await message.answer(
+            "Отправьте скриншот как фото или файл изображения либо нажмите «Отмена».",
+            reply_markup=cancel_keyboard(),
+        )
 
     return router

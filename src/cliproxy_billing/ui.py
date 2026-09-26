@@ -21,17 +21,81 @@ KEYS_BUTTON = "🔑 Мои ключи"
 ADD_KEY_BUTTON = "➕ Добавить ключ"
 PAY_BUTTON = "📷 Оплатить"
 ADMIN_BUTTON = "⚙️ Управление"
+CANCEL_BUTTON = "❌ Отмена"
+BACK_BUTTON = "⬅️ Главное меню"
+USD_BUTTON = "💵 USD"
+RUB_BUTTON = "₽ RUB"
+PAY_FULL_BUTTON = "✅ Погасить всё"
+PAY_CUSTOM_BUTTON = "✏️ Другая сумма / аванс"
+ADMIN_NEW_BUTTON = "🧮 Новый расчёт"
+ADMIN_DRAFT_BUTTON = "📋 Черновик"
+ADMIN_PENDING_BUTTON = "💳 Проверить оплаты"
+ADMIN_USERS_BUTTON = "👥 Участники"
+ADMIN_UNLINKED_BUTTON = "🔑 Непривязанные начисления"
+ADMIN_MANUAL_BUTTON = "➕ Занести платёж / аванс"
+ADMIN_ACTION_BUTTONS = {
+    ADMIN_NEW_BUTTON,
+    ADMIN_DRAFT_BUTTON,
+    ADMIN_PENDING_BUTTON,
+    ADMIN_USERS_BUTTON,
+    ADMIN_UNLINKED_BUTTON,
+    ADMIN_MANUAL_BUTTON,
+}
+DRAFT_PUBLISH_BUTTON = "✅ Опубликовать расчёт"
+DRAFT_DISCARD_BUTTON = "🗑 Удалить черновик"
+
+
+def reply_keyboard(*rows: tuple[str, ...]) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=label) for label in row] for row in rows],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
 def main_keyboard(*, is_admin: bool) -> ReplyKeyboardMarkup:
-    rows = [
-        [KeyboardButton(text=BALANCE_BUTTON), KeyboardButton(text=HISTORY_BUTTON)],
-        [KeyboardButton(text=KEYS_BUTTON), KeyboardButton(text=ADD_KEY_BUTTON)],
-        [KeyboardButton(text=PAY_BUTTON)],
+    rows: list[tuple[str, ...]] = [
+        (BALANCE_BUTTON, HISTORY_BUTTON),
+        (KEYS_BUTTON, ADD_KEY_BUTTON),
+        (PAY_BUTTON,),
     ]
     if is_admin:
-        rows.append([KeyboardButton(text=ADMIN_BUTTON)])
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
+        rows.append((ADMIN_BUTTON,))
+    return reply_keyboard(*rows)
+
+
+def admin_keyboard() -> ReplyKeyboardMarkup:
+    return reply_keyboard(
+        (ADMIN_NEW_BUTTON, ADMIN_DRAFT_BUTTON),
+        (ADMIN_PENDING_BUTTON, ADMIN_USERS_BUTTON),
+        (ADMIN_UNLINKED_BUTTON,),
+        (ADMIN_MANUAL_BUTTON,),
+        (BACK_BUTTON,),
+    )
+
+
+def currency_keyboard() -> ReplyKeyboardMarkup:
+    return reply_keyboard((USD_BUTTON, RUB_BUTTON), (CANCEL_BUTTON,))
+
+
+def payment_choice_keyboard(*, has_debt: bool) -> ReplyKeyboardMarkup:
+    rows: list[tuple[str, ...]] = []
+    if has_debt:
+        rows.append((PAY_FULL_BUTTON,))
+    rows.extend(((PAY_CUSTOM_BUTTON,), (CANCEL_BUTTON,)))
+    return reply_keyboard(*rows)
+
+
+def cancel_keyboard() -> ReplyKeyboardMarkup:
+    return reply_keyboard((CANCEL_BUTTON,))
+
+
+def draft_keyboard() -> ReplyKeyboardMarkup:
+    return reply_keyboard(
+        (DRAFT_PUBLISH_BUTTON,),
+        (DRAFT_DISCARD_BUTTON,),
+        (CANCEL_BUTTON,),
+    )
 
 
 def buttons(*rows: tuple[tuple[str, str], ...]) -> InlineKeyboardMarkup:
@@ -40,14 +104,6 @@ def buttons(*rows: tuple[tuple[str, str], ...]) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=label, callback_data=data) for label, data in row]
             for row in rows
         ]
-    )
-
-
-def user_menu() -> InlineKeyboardMarkup:
-    return buttons(
-        (("💰 Баланс", "user:balance"), ("📜 История", "user:history")),
-        (("🔑 Мои ключи", "user:keys"), ("➕ Добавить ключ", "user:add_key")),
-        (("📷 Оплатить", "pay:start"),),
     )
 
 
@@ -125,7 +181,7 @@ async def send_text(
     chat_id: int,
     text: str,
     *,
-    markup: InlineKeyboardMarkup | None = None,
+    markup: InlineKeyboardMarkup | ReplyKeyboardMarkup | None = None,
 ) -> None:
     """Split long reports to stay under Telegram's message limit."""
     chunks: list[str] = []
