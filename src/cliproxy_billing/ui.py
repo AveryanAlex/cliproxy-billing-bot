@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
+from aiogram.enums import ParseMode
 from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -182,6 +183,7 @@ async def send_text(
     text: str,
     *,
     markup: InlineKeyboardMarkup | ReplyKeyboardMarkup | None = None,
+    parse_mode: ParseMode | None = None,
 ) -> None:
     """Split long reports to stay under Telegram's message limit."""
     chunks: list[str] = []
@@ -204,4 +206,5 @@ async def send_text(
             chat_id,
             chunk,
             reply_markup=markup if index == len(chunks) - 1 else None,
+            parse_mode=parse_mode,
         )

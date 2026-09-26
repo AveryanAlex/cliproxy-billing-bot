@@ -18,6 +18,7 @@ from .config import Settings
 from .db import initialize_database, make_engine, make_sessions
 from .keeper import KeeperClient
 from .navigation import make_fallback_router, make_navigation_router
+from .reminders import make_reminder_scheduler
 from .user_bot import make_user_router
 
 
@@ -39,6 +40,9 @@ async def main() -> None:
     keeper = KeeperClient(settings.keeper_base_url, settings.keeper_login_password)
     billing = BillingService(sessions, keeper, settings.time_zone)
     bot = Bot(token=settings.telegram_bot_token)
+    reminder_scheduler = make_reminder_scheduler(
+        bot, sessions, settings.admin_telegram_ids, settings.time_zone
+    )
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.include_router(
         make_navigation_router(sessions, settings.admin_telegram_ids, settings.time_zone)
@@ -53,8 +57,11 @@ async def main() -> None:
     try:
         await clear_commands(bot, settings.admin_telegram_ids)
         await bot.delete_webhook(drop_pending_updates=False)
+        reminder_scheduler.start()
         await dispatcher.start_polling(bot)
     finally:
+        if reminder_scheduler.running:
+            reminder_scheduler.shutdown(wait=False)
         await keeper.aclose()
         await bot.session.close()
         await engine.dispose()
