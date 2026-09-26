@@ -182,7 +182,7 @@ def make_user_router(
         await bot.send_message(
             user_id,
             f"Валюта: {currency}. Текущий долг: {money_text(due, currency)}. "
-            "Выберите сумму перевода.",
+            "Выберите сумму перевода или сразу отправьте её числом, например 12.34.",
             reply_markup=payment_choice_keyboard(has_debt=due > 0),
         )
 
@@ -275,11 +275,27 @@ def make_user_router(
                 ),
             )
             return
+        error_text = ""
+        if message.text is not None:
+            try:
+                amount = parse_minor(message.text, name="Сумма")
+            except ValueError as error:
+                error_text = f"{error}. "
+            else:
+                await state.update_data(amount_minor=amount)
+                await state.set_state(Paying.screenshot)
+                await message.answer(
+                    f"После перевода {money_text(amount, currency)} отправьте скриншот оплаты "
+                    "как фото или изображение-файл.",
+                    reply_markup=cancel_keyboard(),
+                )
+                return
         async with sessions() as session:
             balance = await get_balance(session, message.from_user.id if message.from_user else 0)
         due = balance.due_usd_cents if currency == "USD" else balance.due_rub_kopeks
         await message.answer(
-            "Выберите «Погасить всё», «Другая сумма / аванс» или «Отмена».",
+            f"{error_text}Выберите «Погасить всё», «Другая сумма / аванс» "
+            "или сразу отправьте сумму числом, например 12.34.",
             reply_markup=payment_choice_keyboard(has_debt=due > 0),
         )
 

@@ -145,6 +145,22 @@ async def test_payment_keyboards_and_invalid_amount(tmp_path: Path) -> None:
         await dispatcher.feed_update(bot, incoming(user_id, CANCEL_BUTTON, 5))
         assert await state.get_state() is None
         assert PAY_BUTTON in request_labels(request)
+
+        await dispatcher.feed_update(bot, incoming(user_id, PAY_BUTTON, 6))
+        await dispatcher.feed_update(bot, incoming(user_id, USD_BUTTON, 7))
+        await dispatcher.feed_update(bot, incoming(user_id, "12,34", 8))
+        assert await state.get_state() == Paying.screenshot.state
+        assert (await state.get_data())["amount_minor"] == 1234
+        assert "$12.34" in request_message(request).text
+        assert request_labels(request) == [CANCEL_BUTTON]
+
+        await dispatcher.feed_update(bot, incoming(user_id, CANCEL_BUTTON, 9))
+        await dispatcher.feed_update(bot, incoming(user_id, PAY_BUTTON, 10))
+        await dispatcher.feed_update(bot, incoming(user_id, USD_BUTTON, 11))
+        await dispatcher.feed_update(bot, incoming(user_id, "12.345", 12))
+        assert await state.get_state() == Paying.choice.state
+        assert "не больше двух знаков" in request_message(request).text
+        assert request_labels(request) == [PAY_CUSTOM_BUTTON, CANCEL_BUTTON]
     await keeper.aclose()
     await bot.session.close()
     await engine.dispose()
