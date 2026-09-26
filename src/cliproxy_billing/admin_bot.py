@@ -407,13 +407,20 @@ def make_admin_router(
             if not rows:
                 lines.append("Пока никто не зарегистрировался.")
         person_rows = [
-            ((user.display_name[:30], f"admin:person:{user.telegram_id}"),) for user in rows
+            (
+                (
+                    f"{user.display_name[:24]} · {user.telegram_id}",
+                    f"admin:person:{user.telegram_id}",
+                ),
+            )
+            for user in rows
         ]
+        person_rows.append((("⬅️ Управление", "admin:home"),))
         await send_text(
             bot,
             admin_id,
             "\n".join(lines),
-            markup=buttons(*person_rows) if person_rows else admin_keyboard(),
+            markup=buttons(*person_rows),
         )
 
     @router.message(F.chat.type == "private", F.text == ADMIN_USERS_BUTTON)
@@ -438,7 +445,7 @@ def make_admin_router(
             admin_id,
             f"{user.display_name} · Telegram ID {user_id}\n"
             f"{balance_text(balance)}\n\n{history_text(balance, time_zone)}",
-            markup=admin_keyboard(),
+            markup=buttons((("⬅️ К участникам", "admin:users"),)),
         )
 
     @router.callback_query(F.data == "admin:home")
