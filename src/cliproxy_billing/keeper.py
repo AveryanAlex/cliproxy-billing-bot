@@ -64,7 +64,7 @@ class KeeperClient:
             )
         except httpx.HTTPError as error:
             raise KeeperError("Нет связи с CPA Usage Keeper") from error
-        if response.status_code != 200 or not self._client.cookies:
+        if response.status_code not in (200, 204) or not self._client.cookies:
             raise KeeperError("Не удалось войти в CPA Usage Keeper; проверьте пароль")
         self._authenticated = True
 

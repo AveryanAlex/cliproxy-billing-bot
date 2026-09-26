@@ -17,8 +17,7 @@ async def test_keeper_auth_key_lookup_and_day_range() -> None:
         if request.url.path.endswith("/auth/login"):
             assert request.headers["X-CPA-Usage-Keeper-Request"] == "fetch"
             return httpx.Response(
-                200,
-                json={"ok": True},
+                204,
                 headers={"Set-Cookie": "cpa_usage_keeper_session=abc; Path=/usage"},
             )
         assert request.headers["Cookie"] == "cpa_usage_keeper_session=abc"
