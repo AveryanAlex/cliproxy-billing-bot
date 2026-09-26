@@ -177,7 +177,8 @@ def make_admin_router(
             )
         except (BillingError, KeeperError, ValueError) as error:
             await message.answer(
-                f"Расчёт не выпущен: {error}\nИсправьте причину и начните заново через /admin."
+                f"Расчёт не выпущен: {error}\n"
+                "Исправьте причину и начните заново через «Управление»."
             )
             return
         await send_text(
@@ -324,9 +325,47 @@ def make_admin_router(
                 )
             if not rows:
                 lines.append("Пока никто не зарегистрировался.")
-            else:
-                lines.append("\nИстория человека: /person TELEGRAM_ID")
-        await send_text(bot, query.from_user.id, "\n".join(lines), markup=admin_menu())
+        menu_rows = [
+            ((user.display_name[:30], f"admin:person:{user.telegram_id}"),) for user in rows
+        ]
+        menu_rows.append((("⬅️ Управление", "admin:home"),))
+        await send_text(
+            bot,
+            query.from_user.id,
+            "\n".join(lines),
+            markup=buttons(*menu_rows),
+        )
+
+    async def show_person(bot: Bot, admin_id: int, user_id: int) -> None:
+        async with sessions() as session:
+            user = await session.get(User, user_id)
+            if user is None:
+                await bot.send_message(admin_id, "Участник не найден.")
+                return
+            balance = await get_balance(session, user_id)
+        await send_text(
+            bot,
+            admin_id,
+            f"{user.display_name} · Telegram ID {user_id}\n"
+            f"{balance_text(balance)}\n\n{history_text(balance, time_zone)}",
+            markup=admin_menu(),
+        )
+
+    @router.callback_query(F.data == "admin:home")
+    async def admin_home_callback(query: CallbackQuery, bot: Bot) -> None:
+        await query.answer()
+        await bot.send_message(
+            query.from_user.id, "Управление расчётами и платежами.", reply_markup=admin_menu()
+        )
+
+    @router.callback_query(F.data.startswith("admin:person:"))
+    async def person_history_callback(query: CallbackQuery, bot: Bot) -> None:
+        await query.answer()
+        try:
+            user_id = int((query.data or "").rsplit(":", 1)[-1])
+        except ValueError:
+            return
+        await show_person(bot, query.from_user.id, user_id)
 
     @router.message(Command("person"))
     async def person_history(message: Message, bot: Bot) -> None:
@@ -336,20 +375,7 @@ def make_admin_router(
         if len(parts) != 2 or not parts[1].isdigit():
             await message.answer("Использование: /person TELEGRAM_ID")
             return
-        user_id = int(parts[1])
-        async with sessions() as session:
-            user = await session.get(User, user_id)
-            if user is None:
-                await message.answer("Участник не найден.")
-                return
-            balance = await get_balance(session, user_id)
-        await send_text(
-            bot,
-            message.from_user.id,
-            f"{user.display_name} · Telegram ID {user_id}\n"
-            f"{balance_text(balance)}\n\n{history_text(balance, time_zone)}",
-            markup=admin_menu(),
-        )
+        await show_person(bot, message.from_user.id, int(parts[1]))
 
     @router.callback_query(F.data == "admin:unlinked")
     async def unlinked_charges(query: CallbackQuery, bot: Bot) -> None:

@@ -5,10 +5,33 @@ from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 from .ledger import Balance
 from .money import money_text
+
+BALANCE_BUTTON = "💰 Баланс"
+HISTORY_BUTTON = "📜 История"
+KEYS_BUTTON = "🔑 Мои ключи"
+ADD_KEY_BUTTON = "➕ Добавить ключ"
+PAY_BUTTON = "📷 Оплатить"
+ADMIN_BUTTON = "⚙️ Управление"
+
+
+def main_keyboard(*, is_admin: bool) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text=BALANCE_BUTTON), KeyboardButton(text=HISTORY_BUTTON)],
+        [KeyboardButton(text=KEYS_BUTTON), KeyboardButton(text=ADD_KEY_BUTTON)],
+        [KeyboardButton(text=PAY_BUTTON)],
+    ]
+    if is_admin:
+        rows.append([KeyboardButton(text=ADMIN_BUTTON)])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
 
 
 def buttons(*rows: tuple[tuple[str, str], ...]) -> InlineKeyboardMarkup:

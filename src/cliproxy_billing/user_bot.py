@@ -15,7 +15,8 @@ from .keeper import KeeperClient, KeeperError
 from .ledger import LedgerError, get_balance, link_key, submit_payment, upsert_user, user_keys
 from .models import Payment, User
 from .money import money_text, parse_minor
-from .ui import balance_text, buttons, history_text, send_text, user_menu
+from .screens import show_balance, show_history, show_keys, show_payment_start
+from .ui import balance_text, buttons, main_keyboard, user_menu
 
 logger = logging.getLogger(__name__)
 
@@ -71,11 +72,6 @@ def make_user_router(
 ) -> Router:
     router = Router(name="users")
 
-    async def show_balance(bot: Bot, user_id: int) -> None:
-        async with sessions() as session:
-            balance = await get_balance(session, user_id)
-        await send_text(bot, user_id, balance_text(balance), markup=user_menu())
-
     @router.message(CommandStart())
     async def start(message: Message, state: FSMContext, bot: Bot) -> None:
         if message.chat.type != "private" or message.from_user is None:
@@ -86,6 +82,11 @@ def make_user_router(
             async with session.begin():
                 await upsert_user(session, user_id, message.from_user.full_name)
             keys = await user_keys(session, user_id)
+        await bot.send_message(
+            user_id,
+            "Выберите действие на клавиатуре ниже. Кнопки также отменяют текущий ввод.",
+            reply_markup=main_keyboard(is_admin=user_id in admin_ids),
+        )
         if not keys:
             await state.set_state(Linking.key)
             await bot.send_message(
@@ -94,14 +95,18 @@ def make_user_router(
                 "После привязки можно добавить ещё один.",
             )
         else:
-            await show_balance(bot, user_id)
+            await show_balance(bot, sessions, user_id)
 
     @router.message(Command("cancel"))
     async def cancel(message: Message, state: FSMContext, bot: Bot) -> None:
         if message.chat.type != "private" or message.from_user is None:
             return
         await state.clear()
-        await bot.send_message(message.from_user.id, "Действие отменено.", reply_markup=user_menu())
+        await bot.send_message(
+            message.from_user.id,
+            "Действие отменено.",
+            reply_markup=main_keyboard(is_admin=message.from_user.id in admin_ids),
+        )
 
     @router.callback_query(F.data == "user:add_key")
     async def add_key(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
@@ -160,41 +165,22 @@ def make_user_router(
     @router.callback_query(F.data == "user:balance")
     async def balance_callback(query: CallbackQuery, bot: Bot) -> None:
         await query.answer()
-        await show_balance(bot, query.from_user.id)
+        await show_balance(bot, sessions, query.from_user.id)
 
     @router.callback_query(F.data == "user:history")
     async def history_callback(query: CallbackQuery, bot: Bot) -> None:
         await query.answer()
-        async with sessions() as session:
-            balance = await get_balance(session, query.from_user.id)
-        await send_text(
-            bot, query.from_user.id, history_text(balance, time_zone), markup=user_menu()
-        )
+        await show_history(bot, sessions, query.from_user.id, time_zone)
 
     @router.callback_query(F.data == "user:keys")
     async def keys_callback(query: CallbackQuery, bot: Bot) -> None:
         await query.answer()
-        async with sessions() as session:
-            keys = await user_keys(session, query.from_user.id)
-        labels = "\n".join(f"• {key.label} (ID {key.keeper_key_id})" for key in keys)
-        await bot.send_message(
-            query.from_user.id,
-            "Ваши ключи:\n" + (labels or "Пока нет привязанных ключей."),
-            reply_markup=buttons((("➕ Добавить ключ", "user:add_key"),)),
-        )
+        await show_keys(bot, sessions, query.from_user.id)
 
     @router.callback_query(F.data == "pay:start")
     async def pay_start(query: CallbackQuery, bot: Bot) -> None:
         await query.answer()
-        async with sessions() as session:
-            balance = await get_balance(session, query.from_user.id)
-        await bot.send_message(
-            query.from_user.id,
-            balance_text(balance) + "\n\nВыберите валюту перевода:",
-            reply_markup=buttons(
-                (("💵 USD", "pay:choose:USD"), ("₽ RUB", "pay:choose:RUB")),
-            ),
-        )
+        await show_payment_start(bot, sessions, query.from_user.id)
 
     @router.callback_query(F.data.startswith("pay:choose:"))
     async def pay_choose(query: CallbackQuery, bot: Bot) -> None:
