@@ -6,12 +6,12 @@ from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .billing import BillingError, BillingService
@@ -43,6 +43,7 @@ from .ui import (
 from .user_bot import send_admin_review
 
 logger = logging.getLogger(__name__)
+PARTICIPANTS_PAGE_SIZE = 8
 
 
 class NewBilling(StatesGroup):
@@ -390,11 +391,30 @@ def make_admin_router(
         except TelegramAPIError:
             logger.warning("Could not notify user %s about payment %s", user_id, payment.id)
 
-    async def users_action(bot: Bot, state: FSMContext, admin_id: int) -> None:
+    async def users_action(
+        bot: Bot,
+        state: FSMContext,
+        admin_id: int,
+        *,
+        page: int = 0,
+        edit_message_id: int | None = None,
+    ) -> None:
         await state.clear()
         async with sessions() as session:
-            rows = list((await session.scalars(select(User).order_by(User.telegram_id))).all())
-            lines = ["Участники:"]
+            total = await session.scalar(select(func.count()).select_from(User)) or 0
+            page_count = max(1, (total + PARTICIPANTS_PAGE_SIZE - 1) // PARTICIPANTS_PAGE_SIZE)
+            page = min(max(page, 0), page_count - 1)
+            rows = list(
+                (
+                    await session.scalars(
+                        select(User)
+                        .order_by(User.telegram_id)
+                        .limit(PARTICIPANTS_PAGE_SIZE)
+                        .offset(page * PARTICIPANTS_PAGE_SIZE)
+                    )
+                ).all()
+            )
+            lines = [f"Участники · страница {page + 1}/{page_count} · всего {total}:"]
             for user in rows:
                 balance = await get_balance(session, user.telegram_id)
                 lines.append(
@@ -406,21 +426,41 @@ def make_admin_router(
                 )
             if not rows:
                 lines.append("Пока никто не зарегистрировался.")
-        person_rows = [
+        person_rows: list[tuple[tuple[str, str], ...]] = [
             (
                 (
                     f"{user.display_name[:24]} · {user.telegram_id}",
-                    f"admin:person:{user.telegram_id}",
+                    f"admin:person:{user.telegram_id}:page:{page}",
                 ),
             )
             for user in rows
         ]
-        person_rows.append((("⬅️ Управление", "admin:home"),))
+        arrows: list[tuple[str, str]] = []
+        if page > 0:
+            arrows.append(("◀️ Назад", f"admin:users:page:{page - 1}"))
+        if page + 1 < page_count:
+            arrows.append(("Вперёд ▶️", f"admin:users:page:{page + 1}"))
+        if arrows:
+            person_rows.append(tuple(arrows))
+        inline_markup = buttons(*person_rows)
+        markup = inline_markup if rows else admin_keyboard()
+        report = "\n".join(lines)
+        if edit_message_id is not None and rows:
+            try:
+                await bot.edit_message_text(
+                    report,
+                    chat_id=admin_id,
+                    message_id=edit_message_id,
+                    reply_markup=inline_markup,
+                )
+                return
+            except TelegramBadRequest:
+                logger.warning("Could not edit participant list in chat %s", admin_id)
         await send_text(
             bot,
             admin_id,
-            "\n".join(lines),
-            markup=buttons(*person_rows),
+            report,
+            markup=markup,
         )
 
     @router.message(F.chat.type == "private", F.text == ADMIN_USERS_BUTTON)
@@ -431,13 +471,37 @@ def make_admin_router(
     @router.callback_query(F.data == "admin:users")
     async def users(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await query.answer()
-        await users_action(bot, state, query.from_user.id)
+        await users_action(
+            bot,
+            state,
+            query.from_user.id,
+            edit_message_id=query.message.message_id if query.message is not None else None,
+        )
 
-    async def show_person(bot: Bot, admin_id: int, user_id: int) -> None:
+    @router.callback_query(F.data.startswith("admin:users:page:"))
+    async def users_page(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+        await query.answer()
+        try:
+            page = int((query.data or "").rsplit(":", 1)[-1])
+        except ValueError:
+            return
+        await users_action(
+            bot,
+            state,
+            query.from_user.id,
+            page=page,
+            edit_message_id=query.message.message_id if query.message is not None else None,
+        )
+
+    async def show_person(bot: Bot, admin_id: int, user_id: int, *, return_page: int = 0) -> None:
         async with sessions() as session:
             user = await session.get(User, user_id)
             if user is None:
-                await bot.send_message(admin_id, "Участник не найден.")
+                await bot.send_message(
+                    admin_id,
+                    "Участник не найден.",
+                    reply_markup=buttons((("⬅️ К участникам", f"admin:users:page:{return_page}"),)),
+                )
                 return
             balance = await get_balance(session, user_id)
         await send_text(
@@ -445,7 +509,7 @@ def make_admin_router(
             admin_id,
             f"{user.display_name} · Telegram ID {user_id}\n"
             f"{balance_text(balance)}\n\n{history_text(balance, time_zone)}",
-            markup=buttons((("⬅️ К участникам", "admin:users"),)),
+            markup=buttons((("⬅️ К участникам", f"admin:users:page:{return_page}"),)),
         )
 
     @router.callback_query(F.data == "admin:home")
@@ -459,12 +523,16 @@ def make_admin_router(
     @router.callback_query(F.data.startswith("admin:person:"))
     async def person_history_callback(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await query.answer()
+        parts = (query.data or "").split(":")
         try:
-            user_id = int((query.data or "").rsplit(":", 1)[-1])
+            if len(parts) not in {3, 5} or (len(parts) == 5 and parts[3] != "page"):
+                return
+            user_id = int(parts[2])
+            page = int(parts[4]) if len(parts) == 5 else 0
         except ValueError:
             return
         await state.clear()
-        await show_person(bot, query.from_user.id, user_id)
+        await show_person(bot, query.from_user.id, user_id, return_page=max(page, 0))
 
     @router.message(Command("person"))
     async def person_history(message: Message, state: FSMContext, bot: Bot) -> None:
