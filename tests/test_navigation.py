@@ -5,9 +5,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
+import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.methods import EditMessageText, SendMessage
+from aiogram.methods import EditMessageReplyMarkup, EditMessageText, SendMessage
 from aiogram.types import (
     CallbackQuery,
     Chat,
@@ -22,8 +23,8 @@ from cliproxy_billing.admin_bot import NewBilling, make_admin_router
 from cliproxy_billing.billing import BillingService
 from cliproxy_billing.db import initialize_database, make_engine, make_sessions
 from cliproxy_billing.keeper import KeeperClient
-from cliproxy_billing.ledger import upsert_user
-from cliproxy_billing.models import BillingRun, KeyCharge, KeyOwnership
+from cliproxy_billing.ledger import submit_payment, upsert_user
+from cliproxy_billing.models import BillingRun, KeyCharge, KeyOwnership, Payment
 from cliproxy_billing.navigation import make_fallback_router, make_navigation_router
 from cliproxy_billing.ui import (
     ADMIN_BUTTON,
@@ -281,6 +282,66 @@ async def test_admin_number_step_has_only_cancel(tmp_path: Path) -> None:
         await dispatcher.feed_update(bot, incoming(42, CANCEL_BUTTON, 3))
         assert await state.get_state() is None
         assert ADMIN_NEW_BUTTON in reply_labels(send_message)
+    await keeper.aclose()
+    await bot.session.close()
+    await engine.dispose()
+
+
+@pytest.mark.parametrize(("action", "status"), [("yes", "accepted"), ("no", "rejected")])
+async def test_review_removes_buttons_after_decision(
+    tmp_path: Path, action: str, status: str
+) -> None:
+    engine = make_engine(f"sqlite+aiosqlite:///{tmp_path}/review-{action}.db")
+    await initialize_database(engine)
+    sessions = make_sessions(engine)
+    async with sessions() as session:
+        async with session.begin():
+            await upsert_user(session, 42, "Person")
+            await session.flush()
+            payment = await submit_payment(
+                session, 42, "RUB", 20000, screenshot_file_id="file-id", screenshot_kind="photo"
+            )
+            payment_id = payment.id
+    keeper = KeeperClient("http://localhost", "unused")
+    bot = Bot("123456:TEST")
+    dispatcher = Dispatcher(storage=MemoryStorage())
+    dispatcher.include_router(
+        make_admin_router(
+            sessions,
+            BillingService(sessions, keeper, ZoneInfo("UTC")),
+            frozenset({99}),
+            ZoneInfo("UTC"),
+        )
+    )
+    with patch.object(bot.session, "make_request", new_callable=AsyncMock) as request:
+        await dispatcher.feed_update(
+            bot, incoming_callback(99, f"review:{action}:{payment_id}", 10)
+        )
+        edits = [
+            call.args[1]
+            for call in request.await_args_list
+            if isinstance(call.args[1], EditMessageReplyMarkup)
+        ]
+        assert len(edits) == 1
+        assert edits[0].chat_id == 99
+        assert edits[0].message_id == 10
+        assert edits[0].reply_markup is None
+
+        await dispatcher.feed_update(
+            bot, incoming_callback(99, f"review:{action}:{payment_id}", 11)
+        )
+        edits = [
+            call.args[1]
+            for call in request.await_args_list
+            if isinstance(call.args[1], EditMessageReplyMarkup)
+        ]
+        assert len(edits) == 2
+        assert edits[1].message_id == 11
+        assert edits[1].reply_markup is None
+        assert "уже проверен" in request_message(request).text
+    async with sessions() as session:
+        reviewed = await session.get(Payment, payment_id)
+        assert reviewed is not None and reviewed.status == status
     await keeper.aclose()
     await bot.session.close()
     await engine.dispose()

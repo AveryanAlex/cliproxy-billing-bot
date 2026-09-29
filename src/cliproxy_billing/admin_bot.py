@@ -359,6 +359,18 @@ def make_admin_router(
         await query.answer()
         await pending_action(bot, state, query.from_user.id)
 
+    async def clear_review_buttons(query: CallbackQuery, bot: Bot, payment_id: int) -> None:
+        if query.message is None:
+            return
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=query.message.chat.id,
+                message_id=query.message.message_id,
+                reply_markup=None,
+            )
+        except TelegramAPIError:
+            logger.warning("Could not remove review buttons for payment %s", payment_id)
+
     @router.callback_query(F.data.startswith("review:"))
     async def review(query: CallbackQuery, bot: Bot) -> None:
         await query.answer()
@@ -366,16 +378,26 @@ def make_admin_router(
         if len(parts) != 3 or parts[1] not in {"yes", "no"}:
             return
         try:
+            payment_id = int(parts[2])
+        except ValueError:
+            await bot.send_message(query.from_user.id, "Неверный номер платежа.")
+            return
+        try:
             async with sessions() as session:
                 async with session.begin():
                     payment = await review_payment(
-                        session, int(parts[2]), query.from_user.id, approve=parts[1] == "yes"
+                        session, payment_id, query.from_user.id, approve=parts[1] == "yes"
                     )
                     user_id = payment.user_id
                 balance = await get_balance(session, user_id)
-        except (LedgerError, ValueError) as error:
+        except LedgerError as error:
+            async with sessions() as session:
+                existing = await session.get(Payment, payment_id)
+            if existing is not None and existing.status != "pending":
+                await clear_review_buttons(query, bot, payment_id)
             await bot.send_message(query.from_user.id, str(error))
             return
+        await clear_review_buttons(query, bot, payment.id)
         status = "подтверждён" if parts[1] == "yes" else "отклонён"
         await bot.send_message(query.from_user.id, f"Платёж #{payment.id} {status}.")
         try:
