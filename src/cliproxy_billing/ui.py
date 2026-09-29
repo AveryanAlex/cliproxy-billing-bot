@@ -26,8 +26,7 @@ CANCEL_BUTTON = "❌ Отмена"
 BACK_BUTTON = "⬅️ Главное меню"
 USD_BUTTON = "💵 USD"
 RUB_BUTTON = "₽ RUB"
-PAY_FULL_BUTTON = "✅ Погасить всё"
-PAY_CUSTOM_BUTTON = "✏️ Другая сумма / аванс"
+PAY_SUGGESTED_PREFIX = "💳 Оплатить "
 ADMIN_NEW_BUTTON = "🧮 Новый расчёт"
 ADMIN_DRAFT_BUTTON = "📋 Черновик"
 ADMIN_PENDING_BUTTON = "💳 Проверить оплаты"
@@ -79,11 +78,22 @@ def currency_keyboard() -> ReplyKeyboardMarkup:
     return reply_keyboard((USD_BUTTON, RUB_BUTTON), (CANCEL_BUTTON,))
 
 
-def payment_choice_keyboard(*, has_debt: bool) -> ReplyKeyboardMarkup:
+def suggested_payment_text(amount_minor: int, currency: str) -> str:
+    if currency == "RUB":
+        rubles = f"{amount_minor // 100:,}".replace(",", " ")
+        return f"{rubles} ₽"
+    return money_text(amount_minor, currency)
+
+
+def suggested_payment_button(amount_minor: int, currency: str) -> str:
+    return PAY_SUGGESTED_PREFIX + suggested_payment_text(amount_minor, currency)
+
+
+def payment_choice_keyboard(*, amount_minor: int, currency: str) -> ReplyKeyboardMarkup:
     rows: list[tuple[str, ...]] = []
-    if has_debt:
-        rows.append((PAY_FULL_BUTTON,))
-    rows.extend(((PAY_CUSTOM_BUTTON,), (CANCEL_BUTTON,)))
+    if amount_minor > 0:
+        rows.append((suggested_payment_button(amount_minor, currency),))
+    rows.append((CANCEL_BUTTON,))
     return reply_keyboard(*rows)
 
 

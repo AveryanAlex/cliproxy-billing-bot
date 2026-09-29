@@ -7,6 +7,7 @@ from cliproxy_billing.money import (
     parse_minor,
     rub_quote_remaining,
     settle_with_rubles,
+    suggested_payment_minor,
 )
 
 
@@ -34,3 +35,11 @@ def test_ruble_partial_settlement_uses_original_quote() -> None:
 def test_money_input_rejects_fractional_kopeks() -> None:
     with pytest.raises(ValueError, match="двух знаков"):
         parse_minor("1.001", name="Сумма")
+
+
+def test_ruble_suggestion_rounds_up_only_when_needed() -> None:
+    assert suggested_payment_minor(2000, "RUB") == 10000
+    assert suggested_payment_minor(15623, "RUB") == 20000
+    assert suggested_payment_minor(20000, "RUB") == 20000
+    assert suggested_payment_minor(15623, "USD") == 15623
+    assert suggested_payment_minor(0, "RUB") == 0

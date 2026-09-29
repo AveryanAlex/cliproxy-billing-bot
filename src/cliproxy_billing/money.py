@@ -28,6 +28,19 @@ def money_text(value: int, currency: str) -> str:
     return "$" + amount if currency == "USD" else f"{amount} ₽"
 
 
+def suggested_payment_minor(due_minor: int, currency: str) -> int:
+    if currency == "USD":
+        return max(due_minor, 0)
+    if currency != "RUB":
+        raise ValueError(f"Неизвестная валюта {currency}")
+    if due_minor <= 0:
+        return 0
+    hundred_rubles_in_kopeks = 10_000
+    return (
+        (due_minor + hundred_rubles_in_kopeks - 1) // hundred_rubles_in_kopeks
+    ) * hundred_rubles_in_kopeks
+
+
 def parse_minor(value: str, *, name: str) -> int:
     parsed = parse_positive_decimal(value, name=name)
     if parsed * 100 != (parsed * 100).to_integral_value():

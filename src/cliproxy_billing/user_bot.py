@@ -13,11 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from .keeper import KeeperClient, KeeperError
 from .ledger import LedgerError, get_balance, link_key, submit_payment, upsert_user
 from .models import Payment, User
-from .money import money_text, parse_minor
+from .money import money_text, parse_minor, suggested_payment_minor
 from .screens import show_balance, show_history, show_keys, show_payment_start
 from .ui import (
-    PAY_CUSTOM_BUTTON,
-    PAY_FULL_BUTTON,
+    PAY_SUGGESTED_PREFIX,
     RUB_BUTTON,
     USD_BUTTON,
     balance_text,
@@ -26,6 +25,8 @@ from .ui import (
     currency_keyboard,
     main_keyboard,
     payment_choice_keyboard,
+    suggested_payment_button,
+    suggested_payment_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,7 +39,6 @@ class Linking(StatesGroup):
 class Paying(StatesGroup):
     currency = State()
     choice = State()
-    amount = State()
     screenshot = State()
 
 
@@ -173,18 +173,39 @@ def make_user_router(
         await state.set_state(Paying.currency)
         await show_payment_start(bot, sessions, query.from_user.id)
 
-    async def choose_currency(bot: Bot, state: FSMContext, user_id: int, currency: str) -> None:
-        await state.update_data(currency=currency)
-        await state.set_state(Paying.choice)
+    async def show_amount_choice(bot: Bot, user_id: int, currency: str, error: str = "") -> None:
         async with sessions() as session:
             balance = await get_balance(session, user_id)
         due = balance.due_usd_cents if currency == "USD" else balance.due_rub_kopeks
+        suggested = suggested_payment_minor(due, currency)
+        if due <= 0:
+            prompt = (
+                f"Долга нет. Если хотите внести аванс, отправьте сумму в {currency} "
+                "числом, например 100."
+            )
+        elif currency == "RUB":
+            prompt = (
+                f"Долг: {money_text(due, currency)}.\n"
+                f"Для удобства предлагаем перевести {suggested_payment_text(suggested, currency)}. "
+            )
+            if suggested > due:
+                prompt += "Разница после подтверждения зачтётся авансом на будущие начисления. "
+            prompt += "Нажмите кнопку или отправьте любую сумму числом."
+        else:
+            prompt = (
+                f"Долг: {money_text(due, currency)}.\n"
+                "Нажмите кнопку или отправьте любую сумму числом."
+            )
         await bot.send_message(
             user_id,
-            f"Валюта: {currency}. Текущий долг: {money_text(due, currency)}. "
-            "Выберите сумму перевода или сразу отправьте её числом, например 12.34.",
-            reply_markup=payment_choice_keyboard(has_debt=due > 0),
+            f"{error}{prompt}",
+            reply_markup=payment_choice_keyboard(amount_minor=suggested, currency=currency),
         )
+
+    async def choose_currency(bot: Bot, state: FSMContext, user_id: int, currency: str) -> None:
+        await state.update_data(currency=currency)
+        await state.set_state(Paying.choice)
+        await show_amount_choice(bot, user_id, currency)
 
     @router.message(Paying.currency, F.text.in_({USD_BUTTON, RUB_BUTTON}))
     async def pay_currency_message(message: Message, state: FSMContext, bot: Bot) -> None:
@@ -208,62 +229,8 @@ def make_user_router(
             return
         await choose_currency(bot, state, query.from_user.id, currency)
 
-    async def choose_full_payment(bot: Bot, state: FSMContext, user_id: int) -> None:
-        data = await state.get_data()
-        currency = str(data.get("currency") or "")
-        if currency not in {"USD", "RUB"}:
-            await state.clear()
-            await bot.send_message(
-                user_id,
-                "Выбор валюты потерян. Начните оплату заново.",
-                reply_markup=main_keyboard(is_admin=user_id in admin_ids),
-            )
-            return
-        async with sessions() as session:
-            balance = await get_balance(session, user_id)
-        amount = balance.due_usd_cents if currency == "USD" else balance.due_rub_kopeks
-        if amount <= 0:
-            await bot.send_message(
-                user_id,
-                "Долга нет. Для аванса выберите другую сумму.",
-                reply_markup=payment_choice_keyboard(has_debt=False),
-            )
-            return
-        await state.update_data(amount_minor=amount)
-        await state.set_state(Paying.screenshot)
-        await bot.send_message(
-            user_id,
-            f"После перевода {money_text(amount, currency)} отправьте скриншот оплаты "
-            "как фото или изображение-файл.",
-            reply_markup=cancel_keyboard(),
-        )
-
-    @router.message(Paying.choice, F.text == PAY_FULL_BUTTON)
-    async def pay_full_message(message: Message, state: FSMContext, bot: Bot) -> None:
-        if message.from_user is not None:
-            await choose_full_payment(bot, state, message.from_user.id)
-
-    @router.message(Paying.choice, F.text == PAY_CUSTOM_BUTTON)
-    async def pay_custom_message(message: Message, state: FSMContext, bot: Bot) -> None:
-        data = await state.get_data()
-        currency = str(data.get("currency") or "")
-        if currency not in {"USD", "RUB"}:
-            await state.clear()
-            await message.answer(
-                "Выбор валюты потерян. Начните оплату заново.",
-                reply_markup=main_keyboard(
-                    is_admin=message.from_user is not None and message.from_user.id in admin_ids
-                ),
-            )
-            return
-        await state.set_state(Paying.amount)
-        await message.answer(
-            f"Введите фактически отправленную сумму в {currency}, например 12.34.",
-            reply_markup=cancel_keyboard(),
-        )
-
     @router.message(Paying.choice)
-    async def require_payment_choice(message: Message, state: FSMContext) -> None:
+    async def receive_payment_amount(message: Message, state: FSMContext, bot: Bot) -> None:
         data = await state.get_data()
         currency = str(data.get("currency") or "")
         if currency not in {"USD", "RUB"}:
@@ -275,76 +242,41 @@ def make_user_router(
                 ),
             )
             return
-        error_text = ""
-        if message.text is not None:
+        if message.from_user is None:
+            return
+        async with sessions() as session:
+            balance = await get_balance(session, message.from_user.id)
+        due = balance.due_usd_cents if currency == "USD" else balance.due_rub_kopeks
+        suggested = suggested_payment_minor(due, currency)
+        label = suggested_payment_button(suggested, currency) if suggested > 0 else None
+        if message.text == label:
+            amount = suggested
+        elif message.text is None:
+            await show_amount_choice(
+                bot, message.from_user.id, currency, "Отправьте сумму числом.\n"
+            )
+            return
+        elif message.text.startswith(PAY_SUGGESTED_PREFIX):
+            await show_amount_choice(
+                bot,
+                message.from_user.id,
+                currency,
+                "Сумма долга изменилась. Выберите новую кнопку.\n",
+            )
+            return
+        else:
             try:
                 amount = parse_minor(message.text, name="Сумма")
             except ValueError as error:
-                error_text = f"{error}. "
-            else:
-                await state.update_data(amount_minor=amount)
-                await state.set_state(Paying.screenshot)
-                await message.answer(
-                    f"После перевода {money_text(amount, currency)} отправьте скриншот оплаты "
-                    "как фото или изображение-файл.",
-                    reply_markup=cancel_keyboard(),
+                await show_amount_choice(
+                    bot, message.from_user.id, currency, f"{error}. Отправьте сумму числом.\n"
                 )
                 return
-        async with sessions() as session:
-            balance = await get_balance(session, message.from_user.id if message.from_user else 0)
-        due = balance.due_usd_cents if currency == "USD" else balance.due_rub_kopeks
-        await message.answer(
-            f"{error_text}Выберите «Погасить всё», «Другая сумма / аванс» "
-            "или сразу отправьте сумму числом, например 12.34.",
-            reply_markup=payment_choice_keyboard(has_debt=due > 0),
-        )
-
-    @router.callback_query(F.data.startswith("pay:full:"))
-    async def pay_full(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-        await query.answer()
-        currency = (query.data or "").rsplit(":", 1)[-1]
-        if currency not in {"USD", "RUB"}:
-            return
-        await state.update_data(currency=currency)
-        await choose_full_payment(bot, state, query.from_user.id)
-
-    @router.callback_query(F.data.startswith("pay:custom:"))
-    async def pay_custom(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-        await query.answer()
-        currency = (query.data or "").rsplit(":", 1)[-1]
-        if currency not in {"USD", "RUB"}:
-            return
-        await state.update_data(currency=currency)
-        await state.set_state(Paying.amount)
-        await bot.send_message(
-            query.from_user.id,
-            f"Введите фактически отправленную сумму в {currency}, например 12.34.",
-            reply_markup=cancel_keyboard(),
-        )
-
-    @router.message(Paying.amount, F.text)
-    async def pay_amount(message: Message, state: FSMContext) -> None:
-        if message.text is None:
-            return
-        try:
-            amount = parse_minor(message.text, name="Сумма")
-        except ValueError as error:
-            await message.answer(f"{error} Введите сумму числом, например 12.34.")
-            return
         await state.update_data(amount_minor=amount)
         await state.set_state(Paying.screenshot)
-        data = await state.get_data()
-        currency = str(data.get("currency"))
         await message.answer(
             f"После перевода {money_text(amount, currency)} отправьте скриншот оплаты "
             "как фото или изображение-файл.",
-            reply_markup=cancel_keyboard(),
-        )
-
-    @router.message(Paying.amount)
-    async def require_amount(message: Message) -> None:
-        await message.answer(
-            "Введите сумму числом, например 12.34, или нажмите «Отмена».",
             reply_markup=cancel_keyboard(),
         )
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
@@ -23,6 +23,7 @@ from cliproxy_billing.billing import BillingService
 from cliproxy_billing.db import initialize_database, make_engine, make_sessions
 from cliproxy_billing.keeper import KeeperClient
 from cliproxy_billing.ledger import upsert_user
+from cliproxy_billing.models import BillingRun, KeyCharge, KeyOwnership
 from cliproxy_billing.navigation import make_fallback_router, make_navigation_router
 from cliproxy_billing.ui import (
     ADMIN_BUTTON,
@@ -31,7 +32,6 @@ from cliproxy_billing.ui import (
     CANCEL_BUTTON,
     KEYS_BUTTON,
     PAY_BUTTON,
-    PAY_CUSTOM_BUTTON,
     RUB_BUTTON,
     USD_BUTTON,
     main_keyboard,
@@ -132,35 +132,108 @@ async def test_payment_keyboards_and_invalid_amount(tmp_path: Path) -> None:
 
         await dispatcher.feed_update(bot, incoming(user_id, USD_BUTTON, 2))
         assert await state.get_state() == Paying.choice.state
-        assert request_labels(request) == [PAY_CUSTOM_BUTTON, CANCEL_BUTTON]
-
-        await dispatcher.feed_update(bot, incoming(user_id, PAY_CUSTOM_BUTTON, 3))
-        assert await state.get_state() == Paying.amount.state
         assert request_labels(request) == [CANCEL_BUTTON]
+        assert "Долга нет" in request_message(request).text
 
-        await dispatcher.feed_update(bot, incoming(user_id, "что-то не то", 4))
-        assert await state.get_state() == Paying.amount.state
-        assert "Введите сумму числом" in request_message(request).text
+        await dispatcher.feed_update(bot, incoming(user_id, "что-то не то", 3))
+        assert await state.get_state() == Paying.choice.state
+        assert "Отправьте сумму числом" in request_message(request).text
 
-        await dispatcher.feed_update(bot, incoming(user_id, CANCEL_BUTTON, 5))
+        await dispatcher.feed_update(bot, incoming(user_id, CANCEL_BUTTON, 4))
         assert await state.get_state() is None
         assert PAY_BUTTON in request_labels(request)
 
-        await dispatcher.feed_update(bot, incoming(user_id, PAY_BUTTON, 6))
-        await dispatcher.feed_update(bot, incoming(user_id, USD_BUTTON, 7))
-        await dispatcher.feed_update(bot, incoming(user_id, "12,34", 8))
+        await dispatcher.feed_update(bot, incoming(user_id, PAY_BUTTON, 5))
+        await dispatcher.feed_update(bot, incoming(user_id, USD_BUTTON, 6))
+        await dispatcher.feed_update(bot, incoming(user_id, "12,34", 7))
         assert await state.get_state() == Paying.screenshot.state
         assert (await state.get_data())["amount_minor"] == 1234
         assert "$12.34" in request_message(request).text
         assert request_labels(request) == [CANCEL_BUTTON]
 
-        await dispatcher.feed_update(bot, incoming(user_id, CANCEL_BUTTON, 9))
-        await dispatcher.feed_update(bot, incoming(user_id, PAY_BUTTON, 10))
-        await dispatcher.feed_update(bot, incoming(user_id, USD_BUTTON, 11))
-        await dispatcher.feed_update(bot, incoming(user_id, "12.345", 12))
+        await dispatcher.feed_update(bot, incoming(user_id, CANCEL_BUTTON, 8))
+        await dispatcher.feed_update(bot, incoming(user_id, PAY_BUTTON, 9))
+        await dispatcher.feed_update(bot, incoming(user_id, USD_BUTTON, 10))
+        await dispatcher.feed_update(bot, incoming(user_id, "12.345", 11))
         assert await state.get_state() == Paying.choice.state
         assert "не больше двух знаков" in request_message(request).text
-        assert request_labels(request) == [PAY_CUSTOM_BUTTON, CANCEL_BUTTON]
+        assert request_labels(request) == [CANCEL_BUTTON]
+    await keeper.aclose()
+    await bot.session.close()
+    await engine.dispose()
+
+
+async def test_ruble_payment_suggestion_and_exact_usd_amount(tmp_path: Path) -> None:
+    engine = make_engine(f"sqlite+aiosqlite:///{tmp_path}/payment-suggestion.db")
+    await initialize_database(engine)
+    sessions = make_sessions(engine)
+    async with sessions() as session:
+        async with session.begin():
+            await upsert_user(session, 42, "Test")
+            run = BillingRun(
+                start_date=date(2026, 9, 1),
+                end_exclusive=date(2026, 9, 26),
+                subscription_usd_cents=200,
+                fee_percent="0",
+                rub_per_usd="78.115",
+                total_usd_cents=200,
+                total_rub_kopeks=15623,
+                status="published",
+                created_by=99,
+            )
+            session.add(run)
+            await session.flush()
+            session.add(KeyOwnership(keeper_key_id="key-42", user_id=42, label="key-42"))
+            session.add(
+                KeyCharge(
+                    run_id=run.id,
+                    keeper_key_id="key-42",
+                    key_label="key-42",
+                    usage_cost_usd="1",
+                    requests=1,
+                    principal_usd_cents=200,
+                    fee_usd_cents=0,
+                    due_usd_cents=200,
+                    due_rub_kopeks=15623,
+                )
+            )
+    keeper = KeeperClient("http://localhost", "unused")
+    bot = Bot("123456:TEST")
+    dispatcher = Dispatcher(storage=MemoryStorage())
+    dispatcher.include_router(make_navigation_router(sessions, frozenset(), ZoneInfo("UTC")))
+    dispatcher.include_router(make_user_router(sessions, keeper, frozenset(), ZoneInfo("UTC")))
+    state = dispatcher.fsm.get_context(bot=bot, chat_id=42, user_id=42)
+    with patch.object(bot.session, "make_request", new_callable=AsyncMock) as request:
+        await dispatcher.feed_update(bot, incoming(42, PAY_BUTTON, 1))
+        await dispatcher.feed_update(bot, incoming(42, RUB_BUTTON, 2))
+        assert request_labels(request) == ["💳 Оплатить 200 ₽", CANCEL_BUTTON]
+        assert "Долг: 156.23 ₽" in request_message(request).text
+        assert "авансом" in request_message(request).text
+
+        await dispatcher.feed_update(bot, incoming(42, "💳 Оплатить 100 ₽", 3))
+        assert await state.get_state() == Paying.choice.state
+        assert "Сумма долга изменилась" in request_message(request).text
+        assert request_labels(request) == ["💳 Оплатить 200 ₽", CANCEL_BUTTON]
+
+        await dispatcher.feed_update(bot, incoming(42, "💳 Оплатить 200 ₽", 4))
+        assert await state.get_state() == Paying.screenshot.state
+        assert (await state.get_data())["amount_minor"] == 20000
+        assert request_labels(request) == [CANCEL_BUTTON]
+
+        await dispatcher.feed_update(bot, incoming(42, CANCEL_BUTTON, 5))
+        await dispatcher.feed_update(bot, incoming(42, PAY_BUTTON, 6))
+        await dispatcher.feed_update(bot, incoming(42, RUB_BUTTON, 7))
+        await dispatcher.feed_update(bot, incoming(42, "156,23", 8))
+        assert await state.get_state() == Paying.screenshot.state
+        assert (await state.get_data())["amount_minor"] == 15623
+
+        await dispatcher.feed_update(bot, incoming(42, CANCEL_BUTTON, 9))
+        await dispatcher.feed_update(bot, incoming(42, PAY_BUTTON, 10))
+        await dispatcher.feed_update(bot, incoming(42, USD_BUTTON, 11))
+        assert request_labels(request) == ["💳 Оплатить $2.00", CANCEL_BUTTON]
+        await dispatcher.feed_update(bot, incoming(42, "💳 Оплатить $2.00", 12))
+        assert await state.get_state() == Paying.screenshot.state
+        assert (await state.get_data())["amount_minor"] == 200
     await keeper.aclose()
     await bot.session.close()
     await engine.dispose()
