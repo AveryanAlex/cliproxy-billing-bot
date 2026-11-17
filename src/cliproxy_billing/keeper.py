@@ -133,10 +133,10 @@ class KeeperClient:
                 "end": end_date.isoformat(),
             },
         )
-        breakdown = payload.get("cost_breakdown")
-        if not isinstance(breakdown, dict):
+        summary = payload.get("cost_summary", payload.get("cost_breakdown"))
+        if not isinstance(summary, dict):
             raise KeeperError("CPA Usage Keeper не вернул стоимость")
-        if not breakdown.get("cost_available"):
+        if not summary.get("cost_available"):
             missing = [
                 str(item.get("label") or item.get("key") or "неизвестная модель")
                 for item in payload.get("model_composition", [])
@@ -174,7 +174,7 @@ class KeeperClient:
                 )
             )
         try:
-            total_cost = Decimal(str(breakdown.get("total_cost_usd") or 0))
+            total_cost = Decimal(str(summary.get("total_cost_usd") or 0))
         except ValueError as error:
             raise KeeperError("Некорректная суммарная стоимость") from error
         return UsageAnalysis(keys=tuple(keys), total_cost_usd=total_cost)

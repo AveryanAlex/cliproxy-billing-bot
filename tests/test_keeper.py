@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -9,7 +10,8 @@ from cliproxy_billing.keeper import KeeperClient, KeeperError
 
 
 @pytest.mark.asyncio
-async def test_keeper_auth_key_lookup_and_day_range() -> None:
+@pytest.mark.parametrize("summary_field", ["cost_summary", "cost_breakdown"])
+async def test_keeper_auth_key_lookup_and_day_range(summary_field: str) -> None:
     requests: list[str] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -27,13 +29,14 @@ async def test_keeper_auth_key_lookup_and_day_range() -> None:
                 json={"items": [{"id": "7", "apiKey": "secret-key", "keyAlias": "One"}]},
             )
         if request.url.path.endswith("/usage/analysis"):
+            assert request.url.params["range"] == "custom"
             assert request.url.params["unit"] == "day"
             assert request.url.params["start"] == "2026-08-01"
             assert request.url.params["end"] == "2026-08-31"
             return httpx.Response(
                 200,
                 json={
-                    "cost_breakdown": {"cost_available": True, "total_cost_usd": 12.345},
+                    summary_field: {"cost_available": True, "total_cost_usd": 12.345},
                     "api_key_composition": [
                         {
                             "key": "7",
@@ -53,7 +56,11 @@ async def test_keeper_auth_key_lookup_and_day_range() -> None:
         assert key is not None and key.id == "7" and key.value is None
         assert await keeper.identify_key("wrong") is None
         analysis = await keeper.analysis(date(2026, 8, 1), date(2026, 9, 1))
-        assert str(analysis.keys[0].cost_usd) == "12.345"
+        assert analysis.total_cost_usd == Decimal("12.345")
+        assert len(analysis.keys) == 1
+        assert analysis.keys[0].key_id == "7"
+        assert analysis.keys[0].cost_usd == Decimal("12.345")
+        assert analysis.keys[0].requests == 3
     assert sum(url.endswith("/auth/login") for url in requests) == 1
 
 
@@ -68,7 +75,7 @@ async def test_keeper_missing_price_blocks_billing() -> None:
         return httpx.Response(
             200,
             json={
-                "cost_breakdown": {"cost_available": False},
+                "cost_summary": {"cost_available": False, "total_cost_usd": 0},
                 "model_composition": [
                     {"key": "local-model", "label": "local-model", "cost_available": False}
                 ],
